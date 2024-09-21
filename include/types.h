@@ -16,6 +16,9 @@ typedef __i8	int8_t;
 typedef __i16	int16_t;
 typedef __i32	int32_t;
 typedef __i64	int64_t;
+
+typedef __i32 int_least32_t;	/* integer of >= 32 bits */
+typedef __i16 int_least16_t;	/* integer of >= 16 bits */
 #else /* USERSPACE_SCOPE */
 
 #include <errno.h>  // IWYU pragma: export
