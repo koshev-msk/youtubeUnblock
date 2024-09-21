@@ -1,6 +1,10 @@
 #ifndef YTB_CONFIG_H
 #define YTB_CONFIG_H
 
+#ifndef KERNEL_SPACE
+#define USER_SPACE
+#endif
+
 typedef int (*raw_send_t)(const unsigned char *data, unsigned int data_len);
 /**
  * Sends the packet after delay_ms. The function should schedule send and return immediately
@@ -91,6 +95,7 @@ extern struct config_t config;
 #define FAKE_STRAT_TTL		2
 #define FAKE_STRAT_PAST_SEQ	3
 #define FAKE_STRAT_TCP_CHECK	4
+#define FAKE_STRAT_TCP_MD5SUM	5
 
 
 #ifndef FAKING_STRATEGY
@@ -109,6 +114,8 @@ extern struct config_t config;
 
 #define MAX_PACKET_SIZE 8192
 
-static const char defaul_snistr[] = "googlevideo.com,ggpht.com,ytimg.com,youtube.com,play.google.com,youtu.be,googleapis.com,googleusercontent.com,gstatic.com,l.google.com";
+#define DEFAULT_SNISTR "googlevideo.com,ggpht.com,ytimg.com,youtube.com,play.google.com,youtu.be,googleapis.com,googleusercontent.com,gstatic.com,l.google.com"
+
+static const char defaul_snistr[] = DEFAULT_SNISTR;
 
 #endif /* YTB_CONFIG_H */

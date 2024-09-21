@@ -12,12 +12,15 @@
   - [Troubleshooting](#troubleshooting)
     - [TV](#tv)
     - [Troubleshooting EPERMS (Operation not permitted)](#troubleshooting-eperms-operation-not-permitted)
-  - [How it works:](#how-it-works)
-  - [How it processes packets](#how-it-processes-packets)
   - [Compilation](#compilation)
   - [OpenWRT case](#openwrt-case)
     - [Building OpenWRT .ipk package](#building-openwrt-ipk-package)
     - [Building with toolchain](#building-with-toolchain)
+  - [Kernel module](#kernel-module)
+    - [Building kernel module](#building-kernel-module)
+      - [Building on host system](#building-on-host-system)
+      - [Building on any kernel](#building-on-any-kernel)
+      - [Building with openwrt SDK](#building-with-openwrt-sdk)
 
 
 # youtubeUnblock
@@ -26,7 +29,22 @@ Bypasses Deep Packet Inspection (DPI) systems that relies on SNI. The package is
 
 The program was primarily developed to bypass YouTube Outage in Russia.
 
-The program is compatible with routers based on OpenWRT, Entware(Keenetic/ASUS) and host machines. The program offers binaries via Github Actions. The binaries of main branch are published in the [development pre-release](https://github.com/Waujito/youtubeUnblock/releases/tag/continuous). Check out [Github Actions](https://github.com/Waujito/youtubeUnblock/actions/workflows/build-ci.yml) if you want to see all the binaries compiled ever. You should know the arcitecture of your hardware to use binaries. On OpenWRT you can check it with command `grep ARCH /etc/openwrt_release`.
+```
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+```
+
+The program is distributed in two version:
+- A userspace application works on top of nfnetlink queue which requires nfnetlink modules in the kernel and firewall rules. This approach is default and normally should be used but it has some limitations on embedded devices which may have no nfnetlink support. Also this solution may break down the internet speed and CPU load on your device because of jumps between userspace and kernelspace for each packet (this behavior may be fixed with connbytes but it also requires conntrack kernel module).
+- A kernel module which integrates deeply within the netfilter stack and does not interact with the userspace firewall. The module requires only netfilter kernel support but it definetly present on every device connected to the Internet. The only difficulity is how to build it. I cannot provide modules within Github Actions for each single one kernel, even if we talk only about OpenWRT versions. If you want to learn more about the module, jump on [its section in the README](#kernel-module)
+
+The program is compatible with routers based on OpenWRT, Entware(Keenetic/ASUS) and host machines. The program offers binaries via Github Actions. The binaries are also available via [github releases](https://github.com/Waujito/youtubeUnblock/releases). Use the latest pre-release for the most up to date build. Check out [Github Actions](https://github.com/Waujito/youtubeUnblock/actions/workflows/build-ci.yml) if you want to see all the binaries compiled ever. You should know the arcitecture of your hardware to use binaries. On OpenWRT you can check it with command `grep ARCH /etc/openwrt_release`.
 
 On both OpenWRT and Entware install the program with opkg. If you got read-only filesystem error you may unpack the binary manually or specify opkg path `opkg -o <destdir>`.
 
@@ -65,12 +83,23 @@ Next step is to add required firewall rules.
 
 For nftables on OpenWRT rules comes out-of-the-box and stored under `/usr/share/nftables.d/ruleset-post/537-youtubeUnblock.nft`. All you need is install requirements and do `/etc/init.d/firewall reload`. If no, go to [Firewall configuration](#firewall-configuration).
 
-Now we are ready to demonize the application.
+Now we go to the configuration. For OpenWRT here is configuration via [UCI](https://openwrt.org/docs/guide-user/base-system/uci) and [LuCI](https://openwrt.org/docs/guide-user/luci/start) available (CLI and GUI respectively).
 
-If you installed package from Github Actions or built it yourself with OpenWRT SDK, rc scripts are preinstalled. All you need is to do `/etc/init.d/youtubeUnblock start`.
-Elsewhere copy `owrt/youtubeUnblock.owrt` to `/etc/init.d/youtubeUnblock` and put the program's binary into /usr/bin/. (Don't forget to `chmod +x` both). Now run `/etc/init.d/youtubeUnblock start`. 
+Luci is a configuration interface for your router (which you connect when enter 192.168.1.1 in browser). LuCI configuration lives in **Services->youtubeUnblock** section. It is self descriptive, with description for each flag. Note, that after you push `Save & Apply` button, the configuration is applied automatically and the service is restarted.
 
-You can also run `/etc/init.d/youtubeUnblock enable` to force OpenWRT autostart on boot, but I don't recommend this since if the package has bugs you may lose access to the router (I think you will be able to reset it with reset settings tricks documented for your router). 
+UCI configuration is available in /etc/config/youtubeUnblock file, in section `youtubeUnblock.youtubeUnblock`. The configuration is done with [flags](#flags). Note, that names of flags are not the same: you should replace `-` with `_`, you shouldn't use leading `--` for flag. Also you will enable toggle flags (without parameters) with `1`. 
+
+For example, to enable trace logs you should do
+```sh
+uci set youtubeUnblock.youtubeUnblock.trace=1
+```
+
+You can check the logs in CLI mode with `logread -l 200 | grep youtubeUnblock` command. 
+
+For uci, to save the configs you should do `uci commit` and then `reload_config` to restart the youtubeUnblock
+
+In CLI mode you will use youtubeUnblock as a normal init.d service:
+for example, you can enable it with `/etc/init.d/youtubeUnblock enable`.
 
 ### Entware
 
@@ -89,15 +118,19 @@ Copy `youtubeUnblock.service` to `/usr/lib/systemd/system` (you should change th
 
 On nftables you should put next nftables rules:
 ```sh
-nft add rule inet fw4 mangle_forward tcp dport 443 ct original "packets < 20" counter queue num 537 bypass
-nft insert rule inet fw4 output mark and 0x8000 == 0x8000 counter accept
+nft add chain inet fw4 youtubeUnblock '{ type filter hook postrouting priority mangle - 1; policy accept; }'
+nft add rule inet fw4 youtubeUnblock 'meta l4proto { tcp, udp } th dport 443 ct original packets < 20 counter queue num 537 bypass'
+nft insert rule inet fw4 output 'mark and 0x8000 == 0x8000 counter accept'
 ```
 
 #### Iptables rules
 
 On iptables you should put next iptables rules:
 ```sh
-iptables -t mangle -A FORWARD -p tcp --dport 443 -m connbytes --connbytes-dir original --connbytes-mode packets --connbytes 0:19 -j NFQUEUE --queue-num 537 --queue-bypass
+iptables -t mangle -N YOUTUBEUNBLOCK
+iptables -t mangle -A YOUTUBEUNBLOCK -p tcp --dport 443 -m connbytes --connbytes-dir original --connbytes-mode packets --connbytes 0:19 -j NFQUEUE --queue-num 537 --queue-bypass
+iptables -t mangle -A YOUTUBEUNBLOCK -p udp --dport 443 -m connbytes --connbytes-dir original --connbytes-mode packets --connbytes 0:19 -j NFQUEUE --queue-num 537 --queue-bypass
+iptables -t mangle -A POSTROUTING -j YOUTUBEUNBLOCK
 iptables -I OUTPUT -m mark --mark 32768/32768 -j ACCEPT
 ```
 
@@ -105,11 +138,12 @@ iptables -I OUTPUT -m mark --mark 32768/32768 -j ACCEPT
 
 For IPv6 on iptables you need to duplicate rules above for ip6tables:
 ```sh
-ip6tables -t mangle -A FORWARD -p tcp --dport 443 -m connbytes --connbytes-dir original --connbytes-mode packets --connbytes 0:19 -j NFQUEUE --queue-num 537 --queue-bypass
+ip6tables -t mangle -N YOUTUBEUNBLOCK
+ip6tables -t mangle -A YOUTUBEUNBLOCK -p tcp --dport 443 -m connbytes --connbytes-dir original --connbytes-mode packets --connbytes 0:19 -j NFQUEUE --queue-num 537 --queue-bypass
+ip6tables -t mangle -A YOUTUBEUNBLOCK -p udp --dport 443 -m connbytes --connbytes-dir original --connbytes-mode packets --connbytes 0:19 -j NFQUEUE --queue-num 537 --queue-bypass
+ip6tables -t mangle -A POSTROUTING -j YOUTUBEUNBLOCK
 ip6tables -I OUTPUT -m mark --mark 32768/32768 -j ACCEPT
 ```
-
-
 
 Note that above rules use *conntrack* to route only first 20 packets from the connection to **youtubeUnblock**. 
 If you got some troubles with it, for example **youtubeUnblock** doesn't detect YouTube, try to delete *connbytes* from the rules. But it is an unlikely behavior and you should probably check your ruleset.
@@ -137,9 +171,9 @@ Put flags to the **BINARY**, not an init script. If you are on OpenWRT you shoul
 
 Available flags:
 
-- `--sni-domains=<comma separated domain list>|all` List of domains you want to be handled by SNI. Use this string if you want to change default domain list. Defaults to `googlevideo.com,ggpht.com,ytimg.com,youtube.com,play.google.com,youtu.be,googleapis.com,googleusercontent.com,gstatic.com,l.google.com`. You can pass **all** if you want for every *ClientHello* to be handled. You can exclude some domains from _all_ with `--exclude-domains` flag.
+- `--sni-domains=<comma separated domain list>|all` List of domains you want to be handled by SNI. Use this string if you want to change default domain list. Defaults to `googlevideo.com,ggpht.com,ytimg.com,youtube.com,play.google.com,youtu.be,googleapis.com,googleusercontent.com,gstatic.com,l.google.com`. You can pass **all** if you want for every *ClientHello* to be handled. You can exclude some domains with `--exclude-domains` flag.
 
-- `--exclude-domains=<comma separated domain list>` List of domains to be excluded from targetting. Useful if you use `--sni-domains=all` and want for some websites to not be targetted by youtubeUnblock. Also the use case is subdomains (for example if you unblock l.google.com, dl.google.com will be also targetted. You can pass it to this flag and it will be ignored).
+- `--exclude-domains=<comma separated domain list>` List of domains to be excluded from targetting.
 
 - `--queue-num=<number of netfilter queue>` The number of netfilter queue **youtubeUnblock** will be linked to. Defaults to **537**.
 
@@ -147,11 +181,12 @@ Available flags:
 
 - `--fake-sni-seq-len=<length>` This flag specifies **youtubeUnblock** to build a complicated construction of fake client hello packets. length determines how much fakes will be sent. Defaults to **1**.
 
-- `--faking-strategy={randseq|ttl|tcp_check|pastseq}` This flag determines the strategy of fake packets invalidation. Defaults to `randseq`
+- `--faking-strategy={randseq|ttl|tcp_check|pastseq|md5sum}` This flag determines the strategy of fake packets invalidation. Defaults to `randseq`
   - `randseq` specifies that random sequence/acknowledgemend random will be set. This option may be handled by provider which uses *conntrack* with drop on invalid *conntrack* state firewall rule enabled. 
   - `ttl` specifies that packet will be invalidated after `--faking-ttl=n` hops. `ttl` is better but may cause issues if unconfigured. 
   - `pastseq` is like `randseq` but sequence number is not random but references the packet sent in the past (before current).
   - `tcp_check` will invalidate faking packet with invalid checksum. May be handled and dropped by some providers/TSPUs.
+  - `md5sum` will invalidate faking packet with invalid TCP md5sum. md5sum is a TCP option which is handled by the destination server but may be skipped by TSPU.
 
 - `--faking-ttl=<ttl>` Tunes the time to live (TTL) of fake SNI messages. TTL is specified like that the packet will go through the DPI system and captured by it, but will not reach the destination server. Defaults to **8**.
 
@@ -200,6 +235,8 @@ If you are on Chromium you may have to disable *kyber* (the feature that makes t
 
 If your browser is using QUIC it may not work properly. Disable it in Chrome in `chrome://flags` and in Firefox `network.http.http{2,3}.enable(d)` in `about:config` option.
 
+It seems like some TSPUs started to block wrongseq packets, so you should play around with faking strategies. I personally recommend to start with `md5sum` faking strategy.
+
 ### TV
 
 Televisions are the biggest headache. 
@@ -228,28 +265,6 @@ Where you have to replace 192.168.. with ip of your television.
     * raw_frags_send EPERM: just make sure outgoing traffic is allowed (RELATED,ESTABLISHED should work, if not, go to step 3)
     * send fake sni EPERM: Fake SNI is out-of-state thing and will likely corrupt the connection (the behavior is expected). conntrack considers it as an invalid packet. By default OpenWRT set up to drop outgoing packets like this one. You may delete nftables/iptables rule that drops packets with invalid conntrack state, but I don't recommend to do this. The step 3 is better solution.
     * Step 3, ultimate solution. Use mark (don't confuse with connmark). The youtubeUnblock uses mark internally to avoid infinity packet loops (when the packet is sent by youtubeUnblock but on next step handled by itself). Currently it uses mark (1 << 15) = 32768. You should put iptables/nftables that ultimately accepts such marks at the very start of the filter OUTPUT chain: `iptables -I OUTPUT -m mark --mark 32768/32768 -j ACCEPT` or `nft insert rule inet fw4 output mark and 0x8000 == 0x8000 counter accept`.
-
-## How it works:
-
-Let's look from the DPI systems side of view: All of they have an ip and tcp information, higher-level data is encrypted. So from the IP header only IP address might be helpful for them to limit user traffic. In TCP here is basically nothing. So they may handle IP addresses and process it. 
-
-What's wrong? Google servers are on the way: It is very hard to handle all that infrastructure. One server may host multiple websites and it is very bad if them blocks, for example, Google Search while trying to block YouTube (googlevideo). But even if YouTube servers have their own IP for only googlevideo purposes, here is a problem about how large is Google infrastracture and how much servers in it. The DPI systems can't even parse normally all the servers, because each video may live on its cache server [GGC](https://support.google.com/interconnect/answer/9058809?hl=en).
-
-So what's else? Let's take a look at a TLS level. All information here is encrypted. All... Except *ClientHello* messages! They are used to initialize handshake connections and hold tons of helpful information. If we talk about TLS version 1.3, it is optimized to transfer as less information as possible unencrypted. But here is only one thing that may point us which domain the user wants to connect, the SNI extension. It transfers all domain names unencrypted in plain text. Exactly what we need! And DPI systems may use this text to detect YouTube connections and slow down or reject them (In fact they are corrupting a TCP connection with bad packets).
-
-So we aim to somehow hide the SNI from them. How?
-
-- We can alter the SNI name in the tls packet to something else. But what's wrong with this? The server also uses SNI name for certificates (CN=). And if we change it, the server will return an invalid certificate which browser can't normally process, which may turn out to the MITM problem.
-
-- We can encrypt it. Here are a lot of investigations about SNI, but the server should support this technique. Also ISPs may block [encrypted SNI](https://en.wikipedia.org/wiki/Server_Name_Indication).
-
-- So what else can we do with the SNI info? If we can't hide it, let's rely on DPI systems weak spots. The DPI is an extremely high loaded infrastructure that analyzes every single packet sent to the Internet. And every performance-impacted feature should be avoided for them. One of this features is IP packet fragmentation. We can split the packet in the middle of SNI message and post it. For DPI fragmentation involves too much overhead: they should store a very big mapping table which maps IP id, Source ip and Destination ip. Also note that some packets may be lost and DPI should support auto-clean of that table. So just imagine how much memory and CPU time will this cost for DPI. But fragments are ok for clients and hosts. And that's the base idea behind this package. I have to mention here that the idea isn't mine, I get in here after some research for this side. Here already was a solution for Windows, GoodbyeDPI. I just made an alternative for Linux.
-
-You may read further in an [yt-dlp issue page](https://github.com/yt-dlp/yt-dlp/issues/10443) and in [ntc party forum](https://ntc.party/t/%D0%BE%D0%B1%D1%81%D1%83%D0%B6%D0%B4%D0%B5%D0%BD%D0%B8%D0%B5-%D0%B7%D0%B0%D0%BC%D0%B5%D0%B4%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5-youtube-%D0%B2-%D1%80%D0%BE%D1%81%D1%81%D0%B8%D0%B8/8074).
-
-## How it processes packets
-
-When the packet is joining the queue, the application checks SNI payload to be YouTube(googlevideo) (right how the DPI systems do), segmentate/fragmentates (both TCP and IP fragmentation techniques are supported) and posts the packet. Note that it is impossible to post two fragmented packets from one netfilter queue verdict. Instead, the application drops an original packet and makes another linux raw socket to post the packets in the network. To escape infinity loops the socket marks outgoing packets and the application automatically accepts it.
 
 ## Compilation
 
@@ -295,5 +310,64 @@ Take a look at `CROSS_COMPILE_PLATFORM` It is required by autotools but I think 
 
 When compilation is done, the binary file will be in build directory. Copy it to your router. Note that a ssh access is likely to be required to proceed. *sshfs* don't work on my model so I injected the application to the router via *Software Upload Package* page. It has given me an error, but also a `/tmp/upload.ipk` file which I copied in root directory, `chmod +x` it and run.
 
+## Kernel module
+
+This section describes the kernel module version of youtubeUnblock. The kernel module operates as a normal module inside the kernel and integrates within the netfilter stack to statelessly mangle the packets sent over the Internet.
+
+You can configure the module with its flags in insmod:
+```
+insmod kyoutubeUnblock.ko fake_sni=1 exclude_domains=.ru quic_drop=1
+```
+
+Note that the flags names are different from ones used for the regular youtubeUnblock(right like in UCI configuration for OpenWRT): replace `-` with `_` and no leading `--`. Also to configure togglers you should set them to `1` (`silent=1 quic_drop=1`)
+
+Also a drop in replacement is supported for all the parameters excluding packet mark. A drop in replacement does not require module restart if you want to change the parameters. You can specify and check the parameters within module's directory inside the sysfs: `/sys/module/kyoutubeUnblock/parameters/`. For example, to set quic_drop to true you may use next command:
+```sh
+echo 1 | sudo tee /sys/module/kyoutubeUnblock/parameters/quic_drop
+```
+and 
+```sh
+cat /sys/module/kyoutubeUnblock/parameters/quic_drop
+```
+to check the parameter.
+
+### Building kernel module
+
+#### Building on host system
+
+To build the kernel module on your host system you should install `linux-headers` which will provide build essential tools and `gcc` compiler suite. On host system you may build the module with 
+```sh
+make kmake
+```
+
+#### Building on any kernel
+
+To build the module for external kernel you should build that kernel locally and point make to it. Use `KERNEL_BUILDER_MAKEDIR=~/linux` flag for make, for example:
+```
+make kmake KERNEL_BUILDER_MAKEDIR=~/linux
+```
+Note, that the kernel should be already configured and built. See linux kernel building manuals for more information about your specific case.
+
+#### Building with openwrt SDK
+
+Building with openwrt SDK is not such a hard thing. The only thing you should do is to obtain the sdk. You can find it by looking to your architecture and version of the openwrt currently used. You should use the exactly your version of openwrt since kernels there change often. You can find the sdk in two ways: by downloading it from their site or by using the openwrt sdk docker container (recommended).
+
+If you decide to download the tar archive, follow next steps:
+For me the archive lives in https://downloads.openwrt.org/releases/23.05.3/targets/ramips/mt76x8/ and called `openwrt-sdk-23.05.3-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64`. You will need to [install sdk requirements on your system](https://openwrt.org/docs/guide-developer/toolchain/install-buildsystem) If you have any problems, use docker ubuntu:24.04 image. Make sure to be a non-root user since some makesystem fails with it. Next, untar the SDK and cd into it. 
+
+Or you can obtain the docker image with sdk built-in: [https://hub.docker.com/u/openwrt/sdk](https://hub.docker.com/u/openwrt/sdk). In my case the image has tag `ramips-mt76x8-23.05.3`. A good thing here is that you don't need to install any dependencies inside the docker container. Also docker hub has a perfect search around tags if you don't sure which one corresponds to your device.
+
+When you unpacked/installed the sdk, you is ready to start with building the kernel module.
+
+Do
+```sh
+echo "src-git youtubeUnblock https://github.com/Waujito/youtubeUnblock.git;openwrt" >> feeds.conf
+./scripts/feeds update youtubeUnblock
+./scripts/feeds install -a -p youtubeUnblock
+make defconfig
+make package/kyoutubeUnblock/compile V=s
+```
+
+When the commands finish, the module is ready. Find it with `find bin -name "kmod-youtubeUnblock*.ipk"`, copy to your host and install to the router via gui software interface. The module should start immediately. If not, do `modprobe kyoutubeUnblock`.
 
  >If you have any questions/suggestions/problems feel free to open an [issue](https://github.com/Waujito/youtubeUnblock/issues).

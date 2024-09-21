@@ -6,7 +6,7 @@
 #include "quic.h"
 #include "logging.h"
 
-#ifndef KERNEL_SCOPE
+#ifndef KERNEL_SPACE
 #include <stdlib.h>
 #endif
 
@@ -25,6 +25,7 @@ int process_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 	int ipver = netproto_version(raw_payload, raw_payload_len);
 	int ret;
 
+
 	if (ipver == IP4VERSION) {
 		ret = ip4_payload_split((uint8_t *)raw_payload, raw_payload_len,
 			 (struct iphdr **)&iph, &iph_len, 
@@ -33,7 +34,7 @@ int process_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 		if (ret < 0)
 			goto accept;
 
-		transport_proto = iph ->protocol;
+		transport_proto = iph->protocol;
 
 	} else if (ipver == IP6VERSION && config.use_ipv6) {
 		ret = ip6_payload_split((uint8_t *)raw_payload, raw_payload_len,
@@ -43,7 +44,7 @@ int process_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 		if (ret < 0)
 			goto accept;
 
-		transport_proto = ip6h->ip6_ctlun.ip6_un1.ip6_un1_nxt;
+		transport_proto = ip6h->ip6_nxt;
 
 	} else {
 		lgtracemsg("Unknown layer 3 protocol version: %d", ipver);
@@ -55,15 +56,13 @@ int process_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 	case IPPROTO_TCP:
 		return process_tcp_packet(raw_payload, raw_payload_len);
 	case IPPROTO_UDP:
-		return process_udp4_packet(raw_payload, raw_payload_len);
+		return process_udp_packet(raw_payload, raw_payload_len);
 	default:
 		goto accept;
 	}
 	
 accept:
 	return PKT_ACCEPT;
-drop:
-	return PKT_DROP;
 }
 
 int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
@@ -73,6 +72,7 @@ int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 	uint32_t tcph_len;
 	const uint8_t *data;
 	uint32_t dlen;
+
 
 	int ipxv = netproto_version(raw_payload, raw_payload_len);
 
@@ -91,7 +91,13 @@ int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 
 	if (tcph->syn && config.synfake) {
 		lgtrace_addp("TCP syn alter");
-		uint8_t payload[MAX_PACKET_SIZE];
+
+		NETBUF_ALLOC(payload, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(payload)) {
+			lgerror("Allocation error", -ENOMEM);
+			goto accept;
+		}
+
 		memcpy(payload, ipxh, iph_len);
 		memcpy(payload + iph_len, tcph, tcph_len);
 		uint32_t fake_len = config.fake_sni_pkt_sz;
@@ -110,32 +116,40 @@ int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 			set_tcp_checksum(tcph, iph, iph_len);
 		} else if (ipxv == IP6VERSION) {
 			struct ip6_hdr *ip6h = (struct ip6_hdr *)payload;
-			ip6h->ip6_ctlun.ip6_un1.ip6_un1_plen = 
-				ntohs(tcph_len + fake_len);
+			ip6h->ip6_plen = ntohs(tcph_len + fake_len);
 			set_ip_checksum(ip6h, iph_len);
 			set_tcp_checksum(tcph, ip6h, iph_len);
 		}
 
 
-
 		ret = instance_config.send_raw_packet(payload, iph_len + tcph_len + fake_len);
 		if (ret < 0) {
 			lgerror("send_syn_altered", ret);
+
+			NETBUF_FREE(payload);
 			goto accept;
 		}
 		lgtrace_addp("rawsocket sent %d", ret);
+
+		NETBUF_FREE(payload);
 		goto drop;
 	}
 
 	if (tcph->syn) goto accept;
 
 	struct tls_verdict vrd = analyze_tls_data(data, dlen);
+	lgtrace_addp("Analyzed, %d", vrd.target_sni);
 
 	if (vrd.target_sni) {
 		lgdebugmsg("Target SNI detected: %.*s", vrd.sni_len, data + vrd.sni_offset);
 
-		uint8_t payload[MAX_PACKET_SIZE];
 		uint32_t payload_len = raw_payload_len;
+		NETBUF_ALLOC(payload, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(payload)) {
+			lgerror("Allocation error", -ENOMEM);
+			goto accept; 
+		}
+
 		memcpy(payload, raw_payload, raw_payload_len);
 
 		void *iph;
@@ -151,7 +165,7 @@ int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 
 		if (ret < 0) {
 			lgerror("tcp_payload_split in targ_sni", ret);
-			goto accept;
+			goto accept_lc;
 		}
 
 		if (config.fk_winsize) {
@@ -198,14 +212,14 @@ int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 				ret = send_tcp_frags(payload, payload_len, poses, cnt, 0);
 				if (ret < 0) {
 					lgerror("tcp4 send frags", ret);
-					goto accept;
+					goto accept_lc;
 				}
 
-				goto drop;
+				goto drop_lc;
 			}
 			break;
 			case FRAG_STRAT_IP: 
-			if (ipxv != IP4VERSION) {
+			if (ipxv == IP4VERSION) {
 				ipd_offset = ((char *)data - (char *)tcph) + vrd.sni_offset;
 				mid_offset = ipd_offset + vrd.sni_len / 2;
 				mid_offset += 8 - mid_offset % 8;
@@ -232,27 +246,36 @@ int process_tcp_packet(const uint8_t *raw_payload, uint32_t raw_payload_len) {
 				ret = send_ip4_frags(payload, payload_len, poses, cnt, 0);
 				if (ret < 0) {
 					lgerror("ip4 send frags", ret);
-					goto accept;
+					goto accept_lc;
 				}
 
-				goto drop;
-				break;
+				goto drop_lc;
 			} else {
 				printf("WARNING: IP fragmentation is supported only for IPv4\n");	
+				goto default_send;
 			}
 			default:
+			default_send:
 				ret = instance_config.send_raw_packet(payload, payload_len);
 				if (ret < 0) {
 					lgerror("raw pack send", ret);
-					goto accept;
+					goto accept_lc;
 				}
 
-				goto drop;
+				goto drop_lc;
 		}
 
 
 
+		goto drop_lc;
+
+accept_lc:
+		NETBUF_FREE(payload);
+		goto accept;
+drop_lc:
+		NETBUF_FREE(payload);
 		goto drop;
+
 	}
 
 accept:
@@ -267,20 +290,22 @@ drop:
 	return PKT_DROP;
 }
 
-int process_udp4_packet(const uint8_t *pkt, uint32_t pktlen) {
-	const struct iphdr *iph;
+int process_udp_packet(const uint8_t *pkt, uint32_t pktlen) {
+	const void *iph;
 	uint32_t iph_len;
 	const struct udphdr *udph;
 	const uint8_t *data;
 	uint32_t dlen;
+	int ipver = netproto_version(pkt, pktlen);
+	lgtrace_start("Got udp packet");
+	lgtrace_addp("IPv%d", ipver);
 
-	int ret = udp4_payload_split((uint8_t *)pkt, pktlen,
-			      (struct iphdr **)&iph, &iph_len, 
+	int ret = udp_payload_split((uint8_t *)pkt, pktlen,
+			      (void **)&iph, &iph_len, 
 			      (struct udphdr **)&udph,
 			      (uint8_t **)&data, &dlen);
 
-	lgtrace_start("Got udp packet");
-
+	
 	if (ret < 0) {
 		lgtrace_addp("undefined");
 		goto accept;
@@ -356,8 +381,19 @@ int send_ip4_frags(const uint8_t *packet, uint32_t pktlen, const uint32_t *poses
 				packet, pktlen);
 		}
 	} else {
-		uint8_t frag1[MAX_PACKET_SIZE];
-		uint8_t frag2[MAX_PACKET_SIZE];
+		NETBUF_ALLOC(frag1, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(frag1)) {
+			lgerror("Allocation error", -ENOMEM);
+			return -ENOMEM;
+		}
+
+		NETBUF_ALLOC(frag2, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(frag2)) {
+			lgerror("Allocation error", -ENOMEM);
+			NETBUF_FREE(frag1);
+			return -ENOMEM;
+		}
+
 		uint32_t f1len = MAX_PACKET_SIZE;
 		uint32_t f2len = MAX_PACKET_SIZE;
 
@@ -365,7 +401,8 @@ int send_ip4_frags(const uint8_t *packet, uint32_t pktlen, const uint32_t *poses
 
 		if (dvs > poses[0]) {
 			lgerror("send_frags: Recursive dvs(%d) is more than poses0(%d)", -EINVAL, dvs, poses[0]);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto erret_lc;
 		}
 
 		ret = ip4_frag(packet, pktlen, poses[0] - dvs, 
@@ -373,7 +410,7 @@ int send_ip4_frags(const uint8_t *packet, uint32_t pktlen, const uint32_t *poses
 
 		if (ret < 0) {
 			lgerror("send_frags: frag: with context packet with size %d, position: %d, recursive dvs: %d", ret, pktlen, poses[0], dvs);
-			return ret;
+			goto erret_lc;
 		}
 
 		if (config.frag_sni_reverse)
@@ -381,21 +418,30 @@ int send_ip4_frags(const uint8_t *packet, uint32_t pktlen, const uint32_t *poses
 send_frag1:
 		ret = send_ip4_frags(frag1, f1len, NULL, 0, 0);
 		if (ret < 0) {
-			return ret;
+			goto erret_lc;
 		}
 
 		if (config.frag_sni_reverse)
-			goto out;
+			goto out_lc;
 
 send_frag2:
 		dvs += poses[0];
 		ret = send_ip4_frags(frag2, f2len, poses + 1, poses_sz - 1, dvs);
 		if (ret < 0) {
-			return ret;
+			goto erret_lc;
 		}
 
 		if (config.frag_sni_reverse)
 			goto send_frag1;
+
+out_lc:
+		NETBUF_FREE(frag1);
+		NETBUF_FREE(frag2);
+		goto out;
+erret_lc:
+		NETBUF_FREE(frag1);
+		NETBUF_FREE(frag2);
+		return ret;
 	}
 
 out:
@@ -419,17 +465,38 @@ int send_tcp_frags(const uint8_t *packet, uint32_t pktlen, const uint32_t *poses
 				packet, pktlen);
 		}
 	} else {
-		uint8_t frag1[MAX_PACKET_SIZE];
-		uint8_t frag2[MAX_PACKET_SIZE];
-		uint8_t fake_pad[MAX_PACKET_SIZE];
+		NETBUF_ALLOC(frag1, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(frag1)) {
+			lgerror("Allocation error", -ENOMEM);
+			return -ENOMEM;
+		}
+
+		NETBUF_ALLOC(frag2, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(frag2)) {
+			lgerror("Allocation error", -ENOMEM);
+			NETBUF_FREE(frag1);
+			return -ENOMEM;
+		}
+
+		NETBUF_ALLOC(fake_pad, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(fake_pad)) {
+			lgerror("Allocation error", -ENOMEM);
+			NETBUF_FREE(frag1);
+			NETBUF_FREE(frag2);
+			return -ENOMEM;
+		}
+
+
 		uint32_t f1len = MAX_PACKET_SIZE;
 		uint32_t f2len = MAX_PACKET_SIZE;
+		uint32_t fake_pad_len = MAX_PACKET_SIZE;
 
 		int ret;
 
 		if (dvs > poses[0]) {
 			lgerror("send_frags: Recursive dvs(%d) is more than poses0(%d)", -EINVAL, dvs, poses[0]);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto erret_lc;
 		}
 
 
@@ -440,7 +507,7 @@ int send_tcp_frags(const uint8_t *packet, uint32_t pktlen, const uint32_t *poses
 
 		if (ret < 0) {
 			lgerror("send_frags: tcp_frag: with context packet with size %d, position: %d, recursive dvs: %d", ret, pktlen, poses[0], dvs);
-			return ret;
+			goto erret_lc;
 		}
 
 
@@ -451,21 +518,21 @@ send_frag1:
 		{
 			ret = send_tcp_frags(frag1, f1len, NULL, 0, 0);
 			if (ret < 0) {
-				return ret;
+				goto erret_lc;
 			}
 
 			if (config.frag_sni_reverse) 
-				goto out;
+				goto out_lc;
 		}
 
 send_fake:
-		// TODO
 		if (config.frag_sni_faked) {
 			uint32_t iphfl, tcphfl;
+			fake_pad_len = f2len;
 			ret = tcp_payload_split(frag2, f2len, NULL, &iphfl, NULL, &tcphfl, NULL, NULL);
 			if (ret < 0) {
 				lgerror("Invalid frag2", ret);
-				return ret;
+				goto erret_lc;
 			}
 			memcpy(fake_pad, frag2, iphfl + tcphfl);
 			memset(fake_pad + iphfl + tcphfl, 0, f2len - iphfl - tcphfl);
@@ -475,14 +542,14 @@ send_fake:
 				fakethdr->seq = htonl(ntohl(fakethdr->seq) - dvs);
 				lgtrace_addp("%u, ", ntohl(fakethdr->seq));
 			}
-			ret = fail_packet(fake_pad, f2len);
+			ret = fail_packet(fake_pad, &fake_pad_len, MAX_PACKET_SIZE);
 			if (ret < 0) {
 				lgerror("Failed to fail packet", ret);
-				return ret;
+				goto erret_lc;
 			}
-			ret = send_tcp_frags(fake_pad, f2len, NULL, 0, 0);
+			ret = send_tcp_frags(fake_pad, fake_pad_len, NULL, 0, 0);
 			if (ret < 0) {
-				return ret;
+				goto erret_lc;
 			}
 
 		}
@@ -495,12 +562,22 @@ send_frag2:
 			dvs += poses[0];
 			ret = send_tcp_frags(frag2, f2len, poses + 1, poses_sz - 1, dvs);
 			if (ret < 0) {
-				return ret;
+				goto erret_lc;
 			}
 
 			if (config.frag_sni_reverse)
 				goto send_fake;
 		}
+out_lc:
+		NETBUF_FREE(frag1);
+		NETBUF_FREE(frag2);
+		NETBUF_FREE(fake_pad);
+		goto out;
+erret_lc:
+		NETBUF_FREE(frag1);
+		NETBUF_FREE(frag2);
+		NETBUF_FREE(fake_pad);
+		return ret;
 	}
 out:
 	return 0;
@@ -520,20 +597,25 @@ int post_fake_sni(const void *iph, unsigned int iph_len,
 	struct tcphdr *fstcph = (void *)rfstcph;
 
 	for (int i = 0; i < sequence_len; i++) {
-		uint8_t fake_sni[MAX_PACKET_SIZE];
+		NETBUF_ALLOC(fake_sni, MAX_PACKET_SIZE);
+		if (!NETBUF_CHECK(fake_sni)) {
+			lgerror("Allocation error", -ENOMEM);
+			return -ENOMEM;
+		}
 		uint32_t fsn_len = MAX_PACKET_SIZE;
 		ret = gen_fake_sni(fsiph, iph_len, fstcph, tcph_len, 
 		     fake_sni, &fsn_len);
 		if (ret < 0) {
 			lgerror("gen_fake_sni", ret);
-			return ret;
+			goto erret_lc;
 		}
 
 		lgtrace_addp("post fake sni #%d", i + 1);
+		lgtrace_addp("post with %d", fsn_len);
 		ret = instance_config.send_raw_packet(fake_sni, fsn_len);
 		if (ret < 0) {
 			lgerror("send fake sni", ret);
-			return ret;
+			goto erret_lc;
 		}
 
 		uint32_t iph_len;
@@ -552,39 +634,20 @@ int post_fake_sni(const void *iph, unsigned int iph_len,
 		fsiph = (void *)rfsiph;
 		fstcph = (void *)rfstcph;
 
+		NETBUF_FREE(fake_sni);
+		continue;
+erret_lc:
+		NETBUF_FREE(fake_sni);
+		return ret;
 	}
 
 	return 0;
-}
-
-void z_function(const char *str, int *zbuf, size_t len) {
-	zbuf[0] = len;
-
-	ssize_t lh = 0, rh = 1;
-	for (ssize_t i = 1; i < len; i++) {
-		zbuf[i] = 0;
-		if (i < rh) {
-			zbuf[i] = min(zbuf[i - lh], rh - i);
-		}
-
-		while (i + zbuf[i] < len && str[zbuf[i]] == str[i + zbuf[i]])
-			zbuf[i]++;
-
-		if (i + zbuf[i] > rh) {
-			lh = i;
-			rh = i + zbuf[i];
-		}
-	}
 }
 
 #define TLS_CONTENT_TYPE_HANDSHAKE 0x16
 #define TLS_HANDSHAKE_TYPE_CLIENT_HELLO 0x01
 #define TLS_EXTENSION_SNI 0x0000
 #define TLS_EXTENSION_CLIENT_HELLO_ENCRYPTED 0xfe0d
-
-typedef uint8_t uint8_t;
-typedef uint32_t uint32_t;
-typedef uint16_t uint16_t;
 
 /**
  * Processes tls payload of the tcp request.
@@ -606,9 +669,7 @@ struct tls_verdict analyze_tls_data(
 
 		uint8_t tls_content_type = *msgData;
 		uint8_t tls_vmajor = *(msgData + 1);
-		uint8_t tls_vminor = *(msgData + 2);
 		uint16_t message_length = ntohs(*(uint16_t *)(msgData + 3));
-		const uint8_t *message_length_ptr = msgData + 3;
 
 		if (tls_vmajor != 0x03) goto nextMessage;
 
@@ -632,7 +693,6 @@ struct tls_verdict analyze_tls_data(
 
 		const uint8_t *msgPtr = handshakeProto;
 		msgPtr += 1; 
-		const uint8_t *handshakeProto_length_ptr = msgPtr + 1;
 		msgPtr += 3 + 2 + 32;
 
 		if (msgPtr + 1 >= data_end) break;
@@ -652,7 +712,6 @@ struct tls_verdict analyze_tls_data(
 
 		if (msgPtr + 2 >= data_end) break;
 		uint16_t extensionsLen = ntohs(*(uint16_t *)msgPtr);
-		const uint8_t *extensionsLen_ptr = msgPtr;
 		msgPtr += 2;
 
 		const uint8_t *extensionsPtr = msgPtr;
@@ -669,7 +728,6 @@ struct tls_verdict analyze_tls_data(
 
 			uint16_t extensionLen = 
 				ntohs(*(uint16_t *)extensionPtr);
-			const uint8_t *extensionLen_ptr = extensionPtr;
 			extensionPtr += 2;
 
 
@@ -684,14 +742,13 @@ struct tls_verdict analyze_tls_data(
 			if (sni_ext_ptr + 2 >= extensions_end) break;
 			uint16_t sni_ext_dlen = ntohs(*(uint16_t *)sni_ext_ptr);
 
-			const uint8_t *sni_ext_dlen_ptr = sni_ext_ptr;
 			sni_ext_ptr += 2;
 
 			const uint8_t *sni_ext_end = sni_ext_ptr + sni_ext_dlen;
 			if (sni_ext_end >= extensions_end) break;
 			
 			if (sni_ext_ptr + 3 >= sni_ext_end) break;
-			uint8_t sni_type = *sni_ext_ptr++;
+			sni_ext_ptr++;
 			uint16_t sni_len = ntohs(*(uint16_t *)sni_ext_ptr);
 			sni_ext_ptr += 2;
 
@@ -793,12 +850,26 @@ brute:
 			config.domains_str[i] == ','	|| 
 			config.domains_str[i] == '\n'	)) {
 
-			uint8_t buf[MAX_PACKET_SIZE]; 
-			int zbuf[MAX_PACKET_SIZE]; 
 			unsigned int domain_len = (i - j);
 			const char *domain_startp = config.domains_str + j;
 
-			if (domain_len + dlen + 1> MAX_PACKET_SIZE) continue;
+			if (domain_len + dlen + 1> MAX_PACKET_SIZE) { 
+				continue;
+			}
+
+			NETBUF_ALLOC(buf, MAX_PACKET_SIZE);
+			if (!NETBUF_CHECK(buf)) {
+				lgerror("Allocation error", -ENOMEM);
+				goto out;
+			}
+			NETBUF_ALLOC(nzbuf, MAX_PACKET_SIZE * sizeof(int));
+			if (!NETBUF_CHECK(nzbuf)) {
+				lgerror("Allocation error", -ENOMEM);
+				NETBUF_FREE(buf);
+				goto out;
+			}
+
+			int *zbuf = (void *)nzbuf;
 
 			memcpy(buf, domain_startp, domain_len);
 			memcpy(buf + domain_len, "#", 1);
@@ -811,12 +882,17 @@ brute:
 					vrd.target_sni = 1;
 					vrd.sni_len = domain_len;
 					vrd.sni_offset = (k - domain_len - 1);
+					NETBUF_FREE(buf);
+					NETBUF_FREE(nzbuf);
 					goto out;
 				}
 			}
 
 
 			j = i + 1;
+
+			NETBUF_FREE(buf);
+			NETBUF_FREE(nzbuf);
 		}
 	}
 
@@ -846,7 +922,7 @@ int gen_fake_sni(const void *ipxh, uint32_t iph_len,
 		memcpy(buf, iph, iph_len);
 		struct ip6_hdr *niph = (struct ip6_hdr *)buf;
 
-		niph->ip6_ctlun.ip6_un1.ip6_un1_nxt = IPPROTO_TCP;
+		niph->ip6_nxt = IPPROTO_TCP;
 	} else {
 		return -EINVAL;
 	}
@@ -854,7 +930,7 @@ int gen_fake_sni(const void *ipxh, uint32_t iph_len,
 	const char *data = config.fake_sni_pkt;
 	size_t data_len = config.fake_sni_pkt_sz;
 
-	size_t dlen = iph_len + tcph_len + data_len;
+	uint32_t dlen = iph_len + tcph_len + data_len;
 
 	if (*buflen < dlen) 
 		return -ENOMEM;
@@ -862,24 +938,33 @@ int gen_fake_sni(const void *ipxh, uint32_t iph_len,
 	memcpy(buf + iph_len, tcph, tcph_len);
 	memcpy(buf + iph_len + tcph_len, data, data_len);
 
-	struct tcphdr *ntcph = (struct tcphdr *)(buf + iph_len);
 
 	if (ipxv == IP4VERSION) {
 		struct iphdr *niph = (struct iphdr *)buf;
 		niph->tot_len = htons(dlen);
 	} else if (ipxv == IP6VERSION) {
 		struct ip6_hdr *niph = (struct ip6_hdr *)buf;
-		niph->ip6_ctlun.ip6_un1.ip6_un1_plen = htons(dlen - iph_len);
+		niph->ip6_plen = htons(dlen - iph_len);
 	}
 
-	fail_packet(buf, *buflen);
-
+	fail_packet(buf, &dlen, *buflen);
 	*buflen = dlen;
 	
 	return 0;
 }
 
-int fail_packet(uint8_t *payload, uint32_t plen) {
+#define TCP_MD5SIG_LEN 16
+#define TCP_MD5SIG_KIND 19
+struct tcp_md5sig_opt {
+	uint8_t kind;
+	uint8_t len;
+	uint8_t sig[TCP_MD5SIG_LEN];
+};
+#define TCP_MD5SIG_OPT_LEN (sizeof(struct tcp_md5sig_opt))
+// Real length of the option, with NOOP fillers
+#define TCP_MD5SIG_OPT_RLEN 20
+
+int fail_packet(uint8_t *payload, uint32_t *plen, uint32_t avail_buflen) {
 	void *iph;
 	uint32_t iph_len;
 	struct tcphdr *tcph;
@@ -888,9 +973,11 @@ int fail_packet(uint8_t *payload, uint32_t plen) {
 	uint32_t dlen;
 	int ret;
 
-	ret = tcp_payload_split(payload, plen, 
+	ret = tcp_payload_split(payload, *plen, 
 			&iph, &iph_len, &tcph, &tcph_len,
 			&data, &dlen);
+
+	uint32_t ipxv = netproto_version(payload, *plen);
 
 	if (ret < 0) {
 		return ret;
@@ -903,7 +990,7 @@ int fail_packet(uint8_t *payload, uint32_t plen) {
 		if (config.fakeseq_offset) {
 			tcph->seq = htonl(ntohl(tcph->seq) - config.fakeseq_offset);
 		} else {
-#ifdef KERNEL_SCOPE
+#ifdef KERNEL_SPACE
 			tcph->seq = 124;
 #else
 			tcph->seq = random();
@@ -920,14 +1007,55 @@ int fail_packet(uint8_t *payload, uint32_t plen) {
 	} else if (config.faking_strategy == FAKE_STRAT_TTL) {
 		lgtrace_addp("set fake ttl to %d", config.faking_ttl);
 
-		uint32_t ipxv = netproto_version(payload, plen);
 		if (ipxv == IP4VERSION) {
 			((struct iphdr *)iph)->ttl = config.faking_ttl;
 		} else if (ipxv == IP6VERSION) {
-			((struct ip6_hdr *)iph)->ip6_ctlun.ip6_un1.ip6_un1_hlim = config.faking_ttl;
+			((struct ip6_hdr *)iph)->ip6_hops = config.faking_ttl;
 		} else {
 			lgerror("fail_packet: IP version is unsupported", -EINVAL);
 			return -EINVAL;
+		}
+	} else if (config.faking_strategy == FAKE_STRAT_TCP_MD5SUM) {
+		int optp_len = tcph_len - sizeof(struct tcphdr);
+		int delta = TCP_MD5SIG_OPT_RLEN - optp_len;
+		lgtrace_addp("Incr delta %d: %d -> %d", delta, optp_len, optp_len + delta);
+		
+		if (delta > 0) {
+			if (avail_buflen - *plen < delta) {
+				return -1;
+			}
+			uint8_t *ndata = data + delta;
+			uint8_t *ndptr = ndata + dlen;
+			uint8_t *dptr = data + dlen;
+			for (size_t i = dlen + 1; i > 0; i--) {
+				*ndptr = *dptr;
+				--ndptr, --dptr;
+			}
+			data = ndata;
+			tcph_len = tcph_len + delta;
+			tcph->doff = tcph_len >> 2;
+			if (ipxv == IP4VERSION) {
+				((struct iphdr *)iph)->tot_len = htons(ntohs(((struct iphdr *)iph)->tot_len) + delta);
+			} else if (ipxv == IP6VERSION) {
+				((struct ip6_hdr *)iph)->ip6_plen = htons(ntohs(((struct ip6_hdr *)iph)->ip6_plen) + delta);
+			} else {
+				lgerror("fail_packet: IP version is unsupported", -EINVAL);
+				return -EINVAL;
+			}
+			optp_len += delta;
+			*plen += delta;
+		}
+
+		uint8_t *optplace = (uint8_t *)tcph + sizeof(struct tcphdr);
+		struct tcp_md5sig_opt *mdopt = (void *)optplace;
+		mdopt->kind = TCP_MD5SIG_KIND;
+		mdopt->len = TCP_MD5SIG_OPT_LEN;
+
+		optplace += sizeof(struct tcp_md5sig_opt);
+		optp_len -= sizeof(struct tcp_md5sig_opt);
+
+		while (optp_len-- > 0) {
+			*optplace++ = 0x01;
 		}
 	}
 
