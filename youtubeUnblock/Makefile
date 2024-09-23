@@ -1,6 +1,7 @@
 # This file is used by OpenWRT SDK buildsystem to package the application for routers.
 
 include $(TOPDIR)/rules.mk
+include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=youtubeUnblock
 PKG_VERSION:=1.0.0
@@ -11,20 +12,31 @@ PKG_SOURCE_URL:=https://github.com/Waujito/youtubeUnblock.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_VERSION:=$(PKG_REV)
 
-LUA_LIBRARYDIR = /usr/lib/lua
-LUCI_LIBRARYDIR = $(LUA_LIBRARYDIR)/luci
-
 include $(INCLUDE_DIR)/package.mk
 
-define Package/youtubeUnblock
-	SECTION:=services
-	CATEGORY:=Networking
-	TITLE:=youtubeUnblock
-	DEPENDS:=+libpthread +luci-base +luci-compat
-	URL:=https://github.com/Waujito/youtubeUnblock
-	MAINTAINER:=Vadim Vetrov <vetrovvd@gmail.com>
-	VERSION:=$(PKG_VERSION)-$(BOARD)-$(PKG_RELEASE)
+define Package/$(PKG_NAME)
+  SECTION:=services
+  CATEGORY:=Networking
+  TITLE:=youtubeUnblock
+  DEPENDS:=+libpthread
+  URL:=https://github.com/Waujito/youtubeUnblock
+  MAINTAINER:=Vadim Vetrov <vetrovvd@gmail.com>
+  VERSION:=$(PKG_VERSION)-$(BOARD)-$(PKG_RELEASE)
 endef
+
+define KernelPackage/$(PKG_NAME)
+  SECTION:=net
+  CATEGORY:=Networking
+  TITLE:=youtubeUnblock kernel module
+  DEPENDS:= +$(PKG_NAME)
+  VERSION:=$(LINUX_VERSION)+$(PKG_VERSION)-$(BOARD)-$(PKG_RELEASE)
+  FILES:=$(PKG_BUILD_DIR)/kyoutubeUnblock.$(LINUX_KMOD_SUFFIX)
+  URL:=https://github.com/Waujito/youtubeUnblock
+  AUTOLOAD:=$(call AutoLoad,33,kyoutubeUnblock)
+  MAINTAINER:=Vadim Vetrov <vetrovvd@gmail.com>
+endef
+
+include $(INCLUDE_DIR)/kernel-defaults.mk
 
 define Package/youtubeUnblock/description
 	Bypasses Googlevideo detection systems that relies on SNI
@@ -42,6 +54,13 @@ define Build/Compile
 		CFLAGS="$(TARGET_CFLAGS)" \
 		LDFLAGS="$(TARGET_LDFLAGS)" \
 		CROSS_COMPILE_PLATFORM="$(TARGET_CROSS:-=)"
+		
+	$(KERNEL_MAKE) -C $(LINUX_DIR) \
+		ARCH="$(LINUX_KARCH)" \
+		CROSS_COMPILE="$(TARGET_CROSS)" \
+		M="$(PKG_BUILD_DIR)" \
+		CONFIG_kyoutubeUnblock=m \
+		modules	
 endef
 
 define Package/youtubeUnblock/install
@@ -53,10 +72,7 @@ define Package/youtubeUnblock/install
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-youtubeUnblock.sh $(1)/etc/uci-defaults/99-youtubeUnblock.sh
 	$(INSTALL_DIR) $(1)/usr/share/nftables.d/ruleset-post/
 	$(INSTALL_DATA) ./files/nftables.d/537-youtubeUnblock.nft $(1)/usr/share/nftables.d/ruleset-post/537-youtubeUnblock.nft
-	$(INSTALL_DIR) $(1)$(LUCI_LIBRARYDIR)/controller
-	$(INSTALL_DIR) $(1)$(LUCI_LIBRARYDIR)/model/cbi
-	$(INSTALL_DATA) ./files/luasrc/controller/* $(1)$(LUCI_LIBRARYDIR)/controller
-	$(INSTALL_DATA) ./files/luasrc/model/cbi/* $(1)$(LUCI_LIBRARYDIR)/model/cbi
 endef
 
 $(eval $(call BuildPackage,youtubeUnblock))
+$(eval $(call KernelPackage,youtubeUnblock))
